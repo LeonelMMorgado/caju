@@ -1,4 +1,3 @@
-# api_server.py
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import docker
@@ -100,7 +99,7 @@ def upnpy_port_forward(host_port: int, internal_port: int, description: str):
         return False, f"ERRO UPnPy: Falha na comunicação: {e}"
 
 # The core Docker launching logic, now a regular Python function
-def _launch_container(template: Dict[str, Any], user_inputs: Dict[str, Any]):
+def _launch_container(job_id: str, template: Dict[str, Any], user_inputs: Dict[str, Any]):
     """
     Função que executa o comando Docker real para o serviço.
     
@@ -160,14 +159,16 @@ def _launch_container(template: Dict[str, Any], user_inputs: Dict[str, Any]):
         # 5. Lógica para Parar e Remover container existente
         try:
             container_to_remove = docker_client.containers.get(container_name)
-            print(f"AVISO: Parando e removendo container {container_name} existente.")
+            print(f"AVISO: Parando e removendo container {container_name} existente")
             container_to_remove.stop(timeout=5)
-            container_to_remove.remove()
+            container_to_remove.remove(force=True) # Use force=True para garantir a remoção
+            print(f"AVISO: Container {container_name} removido com sucesso.")
+            
         except docker.errors.NotFound:
             pass
         except Exception as e:
-            # Captura erro se não puder parar ou remover, mas continua
-            print(f"AVISO: Não foi possível limpar o container antigo: {e}")
+            # Captura qualquer outro erro na limpeza, incluindo o "Resource ID was not provided"
+            print(f"AVISO: Não foi possível limpar o container antigo (erro ignorado): {e}")
 
         # 6. Port Forwarding (UPnPy)
         upnp_success, upnp_message = upnpy_port_forward(
@@ -210,17 +211,6 @@ def _launch_container(template: Dict[str, Any], user_inputs: Dict[str, Any]):
         # Store Fatal Error Result
         LAUNCH_RESULTS[job_id] = {"status": "error", "message": f"ERRO FATAL ao iniciar o container: {str(e)}"}
         return
-
-    except docker.errors.ImageNotFound:
-        # Tenta Pull da Imagem (Melhor seria fazer o Pull em um endpoint separado)
-        print(f"ERRO: Imagem Docker '{image_name}' não encontrada. Tente o Pull manualmente ou implemente o Pull aqui.")
-        return {"status": "error", "message": f"Imagem Docker '{image_name}' não encontrada."}
-        
-    except Exception as e:
-        # Retorna o erro fatal
-        print(f"ERRO FATAL ao iniciar o container: {e}")
-        return {"status": "error", "message": f"ERRO FATAL ao iniciar o container: {e}"}
-
 
 # --- API ENDPOINTS ---
 
