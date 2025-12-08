@@ -218,10 +218,10 @@ export function DeploymentDetails({
             <Activity className="mr-2 h-4 w-4" />
             Visão Geral
           </TabsTrigger>
-          <TabsTrigger value="monitoring">
+          {/* <TabsTrigger value="monitoring">
             <Activity className="mr-2 h-4 w-4" />
             Monitoramento
-          </TabsTrigger>
+          </TabsTrigger> */}
           <TabsTrigger value="settings">
             <Settings className="mr-2 h-4 w-4" />
             Configurações

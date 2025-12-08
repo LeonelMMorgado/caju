@@ -343,7 +343,7 @@ def stop_deployment(id):
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/api/deployments/<id>/start', methods=['POST'])
-def stop_deployment(id):
+def start_deployment(id):
     try:
         container = docker_client.containers.get(id)
         container.start(timeout=5)
@@ -354,7 +354,7 @@ def stop_deployment(id):
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/api/deployments/<id>', methods=['DELETE'])
-def stop_deployment(id):
+def delete_deployment(id):
     try:
         container = docker_client.containers.get(id)
         container.remove(force=True, timeout=5)
