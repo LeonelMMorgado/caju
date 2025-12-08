@@ -331,6 +331,39 @@ def list_deployments():
         
     return jsonify({"status": "success", "deployments": deployments_list})
 
+@app.route('/api/deployments/<id>/stop', methods=['POST'])
+def stop_deployment(id):
+    try:
+        container = docker_client.containers.get(id)
+        container.stop(timeout=5)
+        return jsonify({"status": "success", "message": f"Container {id} parado."})
+    except docker.errors.NotFound:
+        return jsonify({"status": "error", "message": "Container não encontrado."}), 404
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/deployments/<id>/start', methods=['POST'])
+def stop_deployment(id):
+    try:
+        container = docker_client.containers.get(id)
+        container.start(timeout=5)
+        return jsonify({"status": "success", "message": f"Container {id} iniciado."})
+    except docker.errors.NotFound:
+        return jsonify({"status": "error", "message": "Container não encontrado."}), 404
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/deployments/<id>', methods=['DELETE'])
+def stop_deployment(id):
+    try:
+        container = docker_client.containers.get(id)
+        container.remove(force=True, timeout=5)
+        return jsonify({"status": "success", "message": f"Container {id} excluído."})
+    except docker.errors.NotFound:
+        return jsonify({"status": "error", "message": "Container não encontrado."}), 404
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 # --- Next.js Management Functions (Moved from App Class) ---
 
 def start_nextjs_server():

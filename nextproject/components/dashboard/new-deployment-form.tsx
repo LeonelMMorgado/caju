@@ -73,6 +73,7 @@ export function NewDeploymentForm() {
   const [type, setType] = useState<string>("")
   const [memory, setMemory] = useState([512])
   const [cpu, setCpu] = useState([0.5])
+  const [hostPort, setHostPort] = useState<number | string>(25565)
 
   const [minecraftConfig, setMinecraftConfig] = useState({
     serverName: "",
@@ -115,10 +116,7 @@ export function NewDeploymentForm() {
       serviceType = "Minecraft Server" // Nome do template na API Python
       serviceInputs = {
         "Nome do Container": name,
-        // Nota: A porta Host é um campo que falta no seu formulário atual. 
-        // Para corresponder à API Python, estou usando 25565 como fallback. 
-        // Você deve adicionar um campo de input para a porta host.
-        "Porta Local (Host)": 25565, 
+        "Porta Local (Host)": hostPort.toString(), 
         // A memória deve ser uma string com 'G', conforme esperado pelo template Docker
         "Memória RAM (ex: 2G)": `${minecraftConfig.ramGB}G`,
       }
@@ -230,6 +228,21 @@ export function NewDeploymentForm() {
                 required
               />
               <p className="text-xs text-muted-foreground">Escolha um nome único para sua hospedagem</p>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="host-port">Porta de Acesso (Host)</Label>
+              <Input
+                id="host-port"
+                placeholder="25565"
+                type="number"
+                min={1024}
+                max={65535}
+                value={hostPort}
+                onChange={(e) => setHostPort(e.target.value)}
+                required
+              />
+              <p className="text-xs text-muted-foreground">A porta que você usará para conectar ao serviço (Ex: 25565 para Minecraft)</p>
             </div>
 
             <div className="space-y-2">

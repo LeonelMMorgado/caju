@@ -38,6 +38,8 @@ interface Deployment {
   }
 }
 
+const API_BASE_URL = "http://localhost:5000/api"
+
 interface DeploymentDetailsProps {
   deployment: Deployment
   onBack: () => void
@@ -53,6 +55,8 @@ export function DeploymentDetails({
 }: DeploymentDetailsProps) {
   const [deployment, setDeployment] = useState(initialDeployment)
   const [loading, setLoading] = useState(false)
+
+  const [apiError, setApiError] = useState<string | null>(null)
 
   // Simulate real-time metrics updates
   useEffect(() => {
@@ -99,18 +103,60 @@ export function DeploymentDetails({
     }
   }
 
-  const handleStatusToggle = () => {
+  const handleStatusToggle = async () => {
     setLoading(true)
-    const newStatus = deployment.status === "running" ? "stopped" : "running"
-    const updated = { ...deployment, status: newStatus }
-    setDeployment(updated)
-    onUpdate(updated)
-    setLoading(false)
+    setApiError(null)
+
+    const isRunning = deployment.status === "running"
+    const action = isRunning ? "stop" : "start"
+    const endpoint = `${API_BASE_URL}/deployments/${deployment.id}/${action}`
+    const newStatus = isRunning ? "stopped" : "running"
+
+    try {
+      const response = await fetch(endpoint, { method: 'POST' })
+      const data = await response.json()
+
+      if (!response.ok || data.status === 'error') {
+        throw new Error(data.message || `Falha na API: Não foi possível ${action}.`)
+      }
+
+      // Sucesso: Atualiza o estado local e global
+      const updated = { ...deployment, status: newStatus }
+      setDeployment(updated)
+      onUpdate(updated)
+
+    } catch (error) {
+      setApiError(`Erro ao tentar ${action}: ${error instanceof Error ? error.message : 'Desconhecido'}`)
+    } finally {
+      setLoading(false)
+    }
   }
 
-  const handleDelete = () => {
-    if (!confirm("Tem certeza que deseja excluir esta hospedagem?")) return
-    onDelete(deployment.id)
+  const handleDelete = async () => {
+    if (!confirm("Tem certeza que deseja excluir esta hospedagem? Esta ação é irreversível e removerá o container Docker.")) return
+
+    setLoading(true)
+    setApiError(null)
+    const endpoint = `${API_BASE_URL}/deployments/${deployment.id}`
+
+    try {
+      // DELETE: Rota mais comum para exclusão
+      const response = await fetch(endpoint, { method: 'DELETE' })
+      const data = await response.json()
+
+      if (!response.ok || data.status === 'error') {
+        throw new Error(data.message || 'Falha na requisição DELETE.')
+      }
+
+      // Sucesso: Chama a função global para remover do estado e volta para o painel
+      onDelete(deployment.id)
+      onBack() // Retorna ao Dashboard
+
+    } catch (error) {
+      setApiError(`Erro ao excluir: ${error instanceof Error ? error.message : 'Desconhecido'}`)
+    } finally {
+      setLoading(false)
+    }
   }
 
   const formatUptime = (seconds: number) => {
@@ -159,6 +205,12 @@ export function DeploymentDetails({
           </Button>
         </div>
       </div>
+
+      {apiError && (
+        <div className="rounded-lg border border-destructive bg-destructive/10 p-4">
+          <p className="text-sm text-destructive">{apiError}</p>
+        </div>
+      )}
 
       <Tabs defaultValue="overview" className="space-y-6">
         <TabsList>
