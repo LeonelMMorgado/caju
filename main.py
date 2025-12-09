@@ -1,19 +1,41 @@
-import miniupnpc
-import customtkinter as ctk
+from flask import Flask, jsonify, request
+from flask_cors import CORS
 import docker
 import threading
 import os
+import subprocess
+import atexit
+from upnpy.upnp import UPnP
+from typing import Dict, Any
+from collections import deque
+import uuid
 
-SERVICE_TEMPLATES = {
+# --- CONFIGURATION ---
+PYTHON_API_PORT = 5000
+NEXTJS_PORT = 8000
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+NEXTJS_ROOT = os.path.join(BASE_DIR, "nextproject")
+# Path to the node executable packaged with your app
+NODE_PATH = os.path.join(BASE_DIR, "node_bin", "node.exe") 
+NEXT_START_SCRIPT = os.path.join(BASE_DIR, "nextproject", "node_modules", "next", "dist", "bin", "next")
+# ---------------------
+
+app = Flask(__name__)
+# Crucial: Enable CORS to allow Next.js (port 8000) to talk to Flask (port 5000)
+CORS(app) 
+
+# Global state
+docker_client = None
+nextjs_process = None
+service_templates = {
+    # Keep your SERVICE_TEMPLATES here for reference, or load from a config file
     "Minecraft Server": {
-        # Campos de entrada que a UI usará
         "args": {
             "Nome do Container": "meu-minecraft",
-            "Porta Local (Host)": 25565, # Mapeia para ${PORT}
-            "Memória RAM (ex: 2G)": "2G", # Mapeia para ${RAM}
+            "Porta Local (Host)": 25565,
+            "Memória RAM (ex: 2G)": "2G",
         },
         "image": "itzg/minecraft-server",
-        # Configurações reais do Docker, usando chaves ${...}
         "ports": {
             "${PORT}": "25565",
         },
@@ -27,335 +49,449 @@ SERVICE_TEMPLATES = {
     },
 }
 
-class DockerLauncher:
-    """Classe para encapsular a lógica de interação com o Docker."""
+LAUNCH_RESULTS = {}
 
-    def __init__(self, app_ui):
-        self.app_ui = app_ui
-        self.client = None # Inicializa o cliente como None
+def connect_docker():
+    """Tenta a conexão com o Docker Daemon."""
+    global docker_client
+    try:
+        docker_client = docker.from_env()
+        docker_client.version()
+        print("INFO: Conectado ao Docker Daemon com sucesso.")
+        return True
+    except Exception as e:
+        docker_client = None
+        print(f"ERROR: Não foi possível conectar ao Docker. Detalhes: {e}")
+        return False
 
-    def connect_docker(self):
-        """Tenta a conexão com o Docker Daemon."""
-        try:
-            self.client = docker.from_env()
-            # Tenta um comando simples para garantir que a conexão funciona
-            self.client.version()
-            self.app_ui.after(0, self.app_ui.log_message, "Conectado ao Docker Daemon com sucesso.", "green")
-        except Exception as e:
-            self.client = None
-            self.app_ui.after(0, self.app_ui.log_message, f"ERRO: Não foi possível conectar ao Docker. O Docker Daemon pode estar desligado ou as permissões estão incorretas. Detalhes: {e}", "red")
+def upnpy_port_forward(host_port: int, internal_port: int, description: str):
+    """Tenta abrir a porta no roteador usando UPnPy."""
+    print(f"INFO: Tentando encaminhar porta {host_port} via UPnPy...")
+    try:
+        upnp = UPnP.UPnP()
+        # Discover gateway devices (this can take a few seconds)
+        upnp.discover(delay=20) 
+        
+        if not hasattr(upnp, 'hosts') or not upnp.hosts:
+             # Retorna AVISO se nenhum roteador for encontrado
+             return False, "AVISO: Roteador compatível com UPnP não encontrado ou não respondeu."
 
-    def run_service(self, service_name: str, template: Dict[str, Any], user_inputs: Dict[str, Any]):
-        """Inicia a execução do container em uma thread."""
+        # Assumindo o primeiro dispositivo encontrado
+        gateway = upnp.hosts[0].service['WANIPConnection']
 
-        if not self.client:
-            self.app_ui.after(0, self.app_ui.log_message, "Docker não está conectado. Abortando 'Launch'.", "red")
-            return
+        # Tenta adicionar o mapeamento (TCP)
+        success = gateway.AddPortMapping(
+            NewRemoteHost='0.0.0.0', # Empty string for any source IP
+            NewExternalPort=host_port,
+            NewProtocol='TCP',
+            NewInternalPort=internal_port,
+            NewInternalClient=gateway.GetExternalIPAddress()['NewExternalIPAddress'], # Use External IP as internal IP is complex in this context, but safer to use 0.0.0.0 if not strictly needed.
+            NewEnabled=1,
+            NewPortMappingDescription=description,
+            NewLeaseDuration=0 # Permanent
+        )
+        
+        if success:
+            return True, f"SUCESSO: Porta {host_port} encaminhada via UPnPy."
+        else:
+            return False, f"AVISO: Falha ao adicionar mapeamento UPnPy para porta {host_port}."
 
-        thread = threading.Thread(target=self._launch_container,
-                                  args=(service_name, template, user_inputs))
-        thread.start()
+    except Exception as e:
+        return False, f"ERRO UPnPy: Falha na comunicação: {e}"
 
-    def _launch_container(self, service_name, template, user_inputs):
-        """Função que executa o comando Docker real para o Minecraft."""
-
-        self.app_ui.after(0, self.app_ui.log_message, f"Preparando para iniciar '{service_name}'...", "white")
-
+# The core Docker launching logic, now a regular Python function
+def _launch_container(job_id: str, template: Dict[str, Any], user_inputs: Dict[str, Any]):
+    """
+    Função que executa o comando Docker real para o serviço.
+    
+    Recebe template e inputs e retorna um dicionário de status e mensagem.
+    """
+    
+    global docker_client
+    
+    LAUNCH_RESULTS[job_id] = {"status": "running", "message": "Docker launch in progress..."}
+    
+    # 1. Preparação e Mapeamento de Variáveis
+    try:
         container_name = user_inputs.get("Nome do Container")
-        container_volume = os.path.abspath(f'./{container_name}')
         image_name = template["image"]
-
+        # Usa o caminho relativo ao BASE_DIR para garantir que o volume seja criado corretamente
+        container_volume = os.path.abspath(os.path.join(os.path.dirname(__file__), f'./{container_name}_data')) 
+        
+        # O valor da porta host (str) é obtido dos inputs do usuário
+        host_port_str = user_inputs.get("Porta Local (Host)")
+        host_port = int(host_port_str)
+        
         placeholder_map = {
-            "${PORT}": user_inputs.get("Porta Local (Host)"),
+            "${PORT}": host_port_str,
             "${RAM}": user_inputs.get("Memória RAM (ex: 2G)"),
-            "${VOLUME}": container_volume, # O valor do volume local será substituído
+            "${VOLUME}": container_volume,
         }
 
-        # 1. Configurar Portas (ports)
-        # Formato esperado pelo SDK: {'<porta_interna>/tcp': <porta_host>}
+        # 2. Configurar Portas (ports)
         ports_config = {}
         for placeholder_port, internal_port in template["ports"].items():
-            # A porta interna (Minecraft 25565) não muda
             internal_port_key = f'{internal_port}/tcp'
+            ports_config[internal_port_key] = host_port
 
-            # A porta externa (host) é obtida do placeholder_map (ex: ${PORT} -> 25565)
-            host_port = placeholder_map.get(placeholder_port, None)
-
-            if host_port:
-                try:
-                    ports_config[internal_port_key] = int(host_port)
-                    self.app_ui.after(0, self.app_ui.log_message, f"Mapeamento: {internal_port} (Container) -> {host_port} (Host)", "white")
-                except ValueError:
-                    self.app_ui.after(0, self.app_ui.log_message, f"ERRO: Porta '{host_port}' inválida.", "red")
-                    return # Aborta
-            else:
-                 self.app_ui.after(0, self.app_ui.log_message, f"AVISO: Placeholder de porta {placeholder_port} não mapeado.", "orange")
-
-
-        # 2. Configurar Variáveis de Ambiente (environment)
-        # Formato esperado pelo SDK: {'KEY': 'VALUE'}
+        # 3. Configurar Variáveis de Ambiente (environment)
         env_config = {}
         for key, value in template["environment"].items():
-            # Verifica se o valor é um placeholder e substitui
             if value.startswith("${") and value.endswith("}"):
                 env_config[key] = placeholder_map.get(value, value)
             else:
                 env_config[key] = value
 
-            self.app_ui.after(0, self.app_ui.log_message, f"ENV: {key}={env_config[key]}", "blue")
-
-
-        # 3. Configurar Volumes (volumes)
-        # Formato esperado pelo SDK: {'/caminho/host': {'bind': '/caminho/container', 'mode': 'rw'}}
+        # 4. Configurar Volumes (volumes)
         volumes_config = {}
         for host_path_placeholder, container_path in template["volumes"].items():
-            # O host_path_placeholder é o "./data", que pegamos do placeholder_map
             host_path_real = placeholder_map.get(host_path_placeholder, None)
-
+            
             if host_path_real:
+                # Cria a pasta do volume se ela não existir
+                if not os.path.exists(host_path_real):
+                    os.makedirs(host_path_real)
+                    print(f"INFO: Criando diretório de volume: {host_path_real}")
+                    
                 volumes_config[host_path_real] = {'bind': container_path, 'mode': 'rw'}
-                self.app_ui.after(0, self.app_ui.log_message, f"Volume: {host_path_real} (Host) -> {container_path} (Container)", "blue")
-            else:
-                self.app_ui.after(0, self.app_ui.log_message, "AVISO: Caminho do volume local não fornecido.", "orange")
-
 
         # --- Execução do Docker ---
+        
+        # 5. Lógica para Parar e Remover container existente
         try:
-            # Lógica para parar e remover container existente (boa prática)
-            try:
-                container_to_remove = self.client.containers.get(container_name)
-                self.app_ui.after(0, self.app_ui.log_message, f"Parando e removendo container existente: {container_name}", "orange")
-                container_to_remove.stop(timeout=5)
-                container_to_remove.remove()
-            except docker.errors.NotFound:
-                pass
-
-            # Executa o Container com as configurações preparadas
-            container = self.client.containers.run(
-                image_name,
-                detach=True,
-                name=container_name,
-                ports=ports_config,
-                environment=env_config,
-                volumes=volumes_config,
-                restart_policy={"Name": "unless-stopped"} # Política de reinício
-            )
-            self.app_ui.after(0, self.app_ui.log_message, f"SUCESSO: Container '{container_name}' iniciado.", "green")
-            self.app_ui.after(0, self.app_ui.log_message, f"Servidor Minecraft acessível em: localhost:{ports_config.get('25565/tcp')}", "green")
-
-        except docker.errors.ImageNotFound:
-            # Lógica de Pull da Imagem (mantida da versão anterior)
-            self.app_ui.after(0, self.app_ui.log_message, f"ERRO: Imagem Docker '{image_name}' não encontrada. Tentando baixar...", "red")
-            try:
-                 self.client.images.pull(image_name)
-                 self.app_ui.after(0, self.app_ui.log_message, f"SUCESSO: Imagem baixada. Tente o 'Launch' novamente.", "green")
-            except Exception as e:
-                self.app_ui.after(0, self.app_ui.log_message, f"ERRO ao baixar imagem. {e}", "red")
-
+            container_to_remove = docker_client.containers.get(container_name)
+            print(f"AVISO: Parando e removendo container {container_name} existente")
+            container_to_remove.stop(timeout=5)
+            container_to_remove.remove(force=True) # Use force=True para garantir a remoção
+            print(f"AVISO: Container {container_name} removido com sucesso.")
+            
+        except docker.errors.NotFound:
+            pass
         except Exception as e:
-            self.app_ui.after(0, self.app_ui.log_message, f"ERRO FATAL ao iniciar o container: {e}", "red")
+            # Captura qualquer outro erro na limpeza, incluindo o "Resource ID was not provided"
+            print(f"AVISO: Não foi possível limpar o container antigo (erro ignorado): {e}")
 
-class App(ctk.CTk):
-
-    def __init__(self):
-        super().__init__()
-
-        # Configuração da Janela
-        self.title("Docker Service Launcher")
-        self.geometry("800x600")
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(0, weight=1)
-
-        # Inicializa o Docker Launcher
-        self.docker_launcher = DockerLauncher(self)
-        self.current_inputs = {} # Dicionário para armazenar os campos de entrada
-        self.current_service_name = ""
-        self.current_template = {}
-
-        # Cria os Frames de navegação
-        self.list_frame = self.create_list_services_frame()
-        self.form_frame = self.create_service_form_frame()
-
-        # Frame para exibir logs e mensagens
-        self.log_frame = self.create_log_frame()
-        self.log_frame.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 20))
-        self.grid_rowconfigure(1, weight=0) # Log frame não cresce muito
-
-        self.show_frame(self.list_frame)
-        self.docker_launcher.connect_docker()
-
-    def show_frame(self, frame):
-        """Alterna a visualização entre os frames."""
-        # Esconde todos os frames
-        for f in [self.list_frame, self.form_frame]:
-            f.grid_forget()
-
-        # Mostra o frame desejado
-        frame.grid(row=0, column=0, sticky="nsew", padx=20, pady=20)
-        self.grid_rowconfigure(0, weight=1) # O frame principal cresce
-
-
-    ## --- Estrutura da Tela de LISTA ---
-    def create_list_services_frame(self):
-        """Cria o frame inicial com a lista de serviços."""
-        frame = ctk.CTkFrame(self)
-
-        ctk.CTkLabel(frame, text="✅ Selecione um Serviço",
-                    font=ctk.CTkFont(size=24, weight="bold")).pack(pady=20, padx=20)
-
-        # Adiciona um botão para cada serviço no dicionário SERVICE_TEMPLATES
-        for service_name in SERVICE_TEMPLATES.keys():
-            button = ctk.CTkButton(frame, text=service_name,
-                                command=lambda name=service_name: self.show_service_form(name))
-            button.pack(pady=10, padx=50, fill="x")
-
-        return frame
-
-
-    ## --- Estrutura da Tela de FORMULÁRIO ---
-    def create_service_form_frame(self):
-        """Cria o frame de formulário (escondido inicialmente)."""
-        frame = ctk.CTkScrollableFrame(self) # Usar ScrollableFrame se houver muitos campos
-
-        # Título do Formulário (será atualizado)
-        self.form_title = ctk.CTkLabel(frame, text="",
-                                    font=ctk.CTkFont(size=24, weight="bold"))
-        self.form_title.pack(pady=(20, 10), padx=20)
-
-        # Frame para os Inputs (onde os campos serão inseridos dinamicamente)
-        self.input_container = ctk.CTkFrame(frame, fg_color="transparent")
-        self.input_container.pack(fill="x", padx=50, pady=10)
-
-        # Separador
-        ctk.CTkFrame(frame, height=2, fg_color="gray").pack(fill="x", padx=50, pady=20)
-
-        # Botões de Ação
-        back_button = ctk.CTkButton(frame, text="< Voltar", width=150,
-                                    command=lambda: self.show_frame(self.list_frame))
-        back_button.pack(side="left", padx=(50, 10), pady=20)
-
-        self.launch_button = ctk.CTkButton(frame, text="🚀 Launch", width=150,
-                                        command=self.handle_launch_click,
-                                        fg_color="green", hover_color="#006400")
-        self.launch_button.pack(side="right", padx=(10, 50), pady=20)
-
-        return frame
-
-
-    def show_service_form(self, service_name: str):
-        """Popula o formulário com os argumentos do serviço escolhido."""
-
-        self.current_service_name = service_name
-        self.current_template = SERVICE_TEMPLATES[service_name]
-        self.current_inputs.clear()
-
-        self.form_title.configure(text=service_name)
-
-        # Limpa os widgets antigos do input_container
-        for widget in self.input_container.winfo_children():
-            widget.destroy()
-
-        # Adiciona novos widgets baseados no template
-        for i, (arg_name, default_value) in enumerate(self.current_template["args"].items()):
-            label = ctk.CTkLabel(self.input_container, text=f"{arg_name}:")
-            label.grid(row=i, column=0, sticky="w", padx=10, pady=5)
-
-            entry = ctk.CTkEntry(self.input_container, width=300)
-            entry.insert(0, str(default_value)) # Seta o valor padrão
-            entry.grid(row=i, column=1, sticky="ew", padx=10, pady=5)
-
-            self.current_inputs[arg_name] = entry # Armazena a referência do campo
-
-        # Garante que o container de inputs se estique
-        self.input_container.grid_columnconfigure(1, weight=1)
-
-        self.show_frame(self.form_frame)
-        self.log_message(f"Pronto para configurar: {service_name}", "blue")
-
-
-    def handle_launch_click(self):
-        """Ação do botão 'Launch': coleta os dados e chama o Docker."""
-
-        user_data = {}
-        valid = True
-
-        # 1. Coletar e Validar Dados
-        for arg_name, entry_widget in self.current_inputs.items():
-            value = entry_widget.get().strip()
-
-            # Validação simples de Porta (exige número)
-            if "Porta Local" in arg_name and value:
-                try:
-                    int(value)
-                except ValueError:
-                    self.log_message(f"ERRO: A porta deve ser um número inteiro em '{arg_name}'.", "red")
-                    valid = False
-
-            # Validação simples de campo obrigatório (Nome do Container)
-            if "Nome do Container" in arg_name and not value:
-                self.log_message(f"ERRO: O campo '{arg_name}' é obrigatório.", "red")
-                valid = False
-
-            user_data[arg_name] = value
-
-        if not valid:
-            return
-
-        self.log_message("Dados válidos. Executando 'Docker Launcher'...", "green")
-        self.launch_button.configure(state="disabled", text="Lançando...")
-
-        # 2. Chamar a lógica do Docker
-        self.docker_launcher.run_service(
-            service_name=self.current_service_name,
-            template=self.current_template,
-            user_inputs=user_data
+        # 6. Port Forwarding (UPnPy)
+        upnp_success, upnp_message = upnpy_port_forward(
+            host_port=host_port,
+            internal_port=25565, # A porta interna do container (Minecraft)
+            description=f"Docker {container_name}"
         )
+        print(f"INFO UPnP: {upnp_message}")
 
-        # Habilita o botão após um pequeno delay ou na thread do Docker (melhor)
-        # Neste exemplo, vamos reabilitar no fim da função do Docker.
-        self.after(3000, lambda: self.launch_button.configure(state="normal", text="Launch"))
+        # 7. Executa o Container
+        container = docker_client.containers.run(
+            image_name,
+            detach=True,
+            name=container_name,
+            ports=ports_config,
+            environment=env_config,
+            volumes=volumes_config,
+            restart_policy={"Name": "unless-stopped"}
+        )
+        
+        # 8. Store Final Success Result
+        result_payload = {
+            "status": "success", 
+            "message": f"Container '{container_name}' iniciado com sucesso. Porta Host: {host_port}. UPnP: {upnp_message}",
+            "details": {
+                "container_id": container.id,
+                "host_port": host_port,
+                "upnp_status": "Success" if upnp_success else "Failure"
+            }
+        }
+        LAUNCH_RESULTS[job_id] = result_payload
+        return 
 
+    except docker.errors.ImageNotFound:
+        # Store Error Result
+        LAUNCH_RESULTS[job_id] = {"status": "error", "message": f"Imagem Docker '{image_name}' não encontrada."}
+        return 
+        
+    except Exception as e:
+        # Store Fatal Error Result
+        LAUNCH_RESULTS[job_id] = {"status": "error", "message": f"ERRO FATAL ao iniciar o container: {str(e)}"}
+        return
 
-    ## --- Log/Mensagens ---
-    def create_log_frame(self):
-        """Cria a caixa de texto para exibir as mensagens de log."""
-        frame = ctk.CTkFrame(self)
+# --- API ENDPOINTS ---
 
-        ctk.CTkLabel(frame, text="Log de Atividades:",
-                    font=ctk.CTkFont(size=16, weight="bold")).pack(padx=10, pady=(10, 5), anchor="w")
+@app.route('/api/status', methods=['GET'])
+def get_status():
+    """Retorna o status de conexão Docker e templates disponíveis."""
+    docker_status = "Connected" if docker_client else "Disconnected"
+    return jsonify({
+        "docker_status": docker_status,
+        "templates": service_templates
+    })
 
-        self.log_text = ctk.CTkTextbox(frame, height=100, wrap="word", state="disabled")
-        self.log_text.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+@app.route('/api/launch', methods=['POST'])
+def launch_container_endpoint():
+    """Endpoint para iniciar um container."""
+    data = request.json
+    service_name = data.get('service_name')
+    user_inputs = data.get('user_inputs')
+    
+    if not docker_client:
+        return jsonify({"status": "error", "message": "Docker Daemon not connected."}), 400
+        
+    template = service_templates.get(service_name)
+    if not template:
+        return jsonify({"status": "error", "message": f"Service '{service_name}' not found."}), 404
 
-        return frame
+    job_id = str(uuid.uuid4())
+    
+    LAUNCH_RESULTS[job_id] = {"status": "initiated", "message": "Job received and queued."}
 
-    def log_message(self, message: str, color: str = "white"):
-        """Adiciona uma mensagem ao log e rola para baixo."""
-        self.log_text.configure(state="normal")
+    # Run the Docker logic in a separate thread, passing the job_id
+    thread = threading.Thread(target=_launch_container, args=(job_id, template, user_inputs))
+    thread.start()
+    
+    # Return the job ID immediately
+    return jsonify({
+        "status": "initiated", 
+        "message": "Launch job started in background.", 
+        "job_id": job_id
+    })
 
-        # Cria uma tag de cor se não existir
-        if color not in self.log_text.tag_names():
-            self.log_text.tag_config(color, foreground=color)
+@app.route('/api/job/status/<job_id>', methods=['GET'])
+def get_job_status(job_id):
+    """Endpoint para verificar o status de um Job ID de lançamento de container."""
+    
+    result = LAUNCH_RESULTS.get(job_id)
+    
+    if not result:
+        return jsonify({"status": "error", "message": f"Job ID {job_id} not found."}), 404
+    
+    # If status is "success" or "error", the job is complete.
+    if result["status"] in ["success", "error"]:
+        LAUNCH_RESULTS.pop(job_id, None) 
+        return jsonify(result)
+        
+    # If status is still "running" or "initiated"
+    return jsonify({"status": "running", "message": result["message"]})
 
-        full_message = f"[{ctk.get_appearance_mode().upper()}] {message}\n"
-        self.log_text.insert("end", full_message, color)
-        self.log_text.see("end") # Rola para o final
+@app.route('/api/deployments', methods=['GET'])
+def list_deployments():
+    """Retorna uma lista de containers em execução formatada para o frontend."""
+    global docker_client
+    
+    if not docker_client:
+        return jsonify({"status": "error", "message": "Docker Daemon not connected. Cannot list containers.", "deployments": []}), 500
 
-        self.log_text.configure(state="disabled")
+    deployments_list = []
+    
+    try:
+        containers = docker_client.containers.list(all=True)
+        
+        for idx, container in enumerate(containers):
+            # Tenta inferir o tipo ('minecraft', 'discord-bot') pelo nome da imagem ou rótulos
+            
+            # Exemplo de inferência de tipo (pode ser mais sofisticado)
+            image_name = container.image.tags[0] if container.image.tags else container.image.id
+            container_type = "mini-app"
+            if "minecraft" in image_name:
+                container_type = "minecraft"
+            elif "discord" in image_name or "node" in image_name:
+                container_type = "discord-bot"
 
-if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+            # Tenta encontrar a porta Host (útil para o frontend)
+            host_port = "N/A"
+            if container.ports:
+                # Ports é um dicionário. Ex: {'25565/tcp': [{'HostIp': '0.0.0.0', 'HostPort': '25565'}]}
+                for internal_port_key, mappings in container.ports.items():
+                    if mappings:
+                        host_port = mappings[0]['HostPort']
+                        break
+                        
+            # Mapeamento para o formato do estado do Next.js
+            deployments_list.append({
+                "id": container.short_id,
+                "name": container.name,
+                "type": container_type, # Tipo inferido
+                "status": container.status, # 'running', 'exited', etc.
+                "created_at": container.attrs['Created'], # Data de criação
+                "memory_mb": container.attrs['Config'].get('Memory') or 0, # Memória alocada (pode ser 0 se não limitado)
+                "cpu_cores": container.attrs['Config'].get('NanoCpus') or 0, # Cores (também pode ser 0)
+                "host_port": host_port, # Porta para acesso
+            })
 
-#upnp = miniupnpc.UPnP()
-#
-#upnp.discoverdelay = 10
-#upnp.discover()
-#
-#upnp.selectigd()
-#
-#port = 43210
-#
-## addportmapping(external-port, protocol, internal-host, internal-port, description, remote-host)
-#upnp.addportmapping(port, 'TCP', upnp.lanaddr, port, 'testing', '')
-#
+    except Exception as e:
+        print(f"ERRO ao listar containers Docker: {e}")
+        return jsonify({"status": "error", "message": f"Erro interno ao consultar Docker: {e}", "deployments": []}), 500
+        
+    return jsonify({"status": "success", "deployments": deployments_list})
+
+@app.route('/api/deployments/<id>/metrics', methods=['GET'])
+def get_deployment_metrics(id):
+    global docker_client
+    
+    try:
+        container = docker_client.containers.get(id)
+        
+        stats_result = container.stats(stream=False)
+        
+        try:
+            stats = next(stats_result)
+        except TypeError:
+            stats = stats_result
+            
+        if not isinstance(stats, dict):
+             raise TypeError(f"A API de stats retornou tipo inválido: {type(stats)}")
+        
+        # --- Cálculo do Uso de CPU ---
+        cpu_percent = 0.0
+        
+        cpu_stats = stats.get('cpu_stats', {})
+        precpu_stats = stats.get('precpu_stats', {})
+        
+        if cpu_stats and precpu_stats:
+            # Uso total de CPU pelo container
+            container_cpu_usage = cpu_stats.get('cpu_usage', {}).get('total_usage', 0)
+            pre_container_cpu_usage = precpu_stats.get('cpu_usage', {}).get('total_usage', 0)
+            
+            # Uso total de CPU do sistema host
+            system_cpu_usage = cpu_stats.get('system_cpu_usage', 0)
+            pre_system_cpu_usage = precpu_stats.get('system_cpu_usage', 0)
+            
+            # Número de CPUs disponíveis online
+            number_cpus = cpu_stats.get('online_cpus', 1) 
+            
+            # Calculando deltas
+            cpu_delta = container_cpu_usage - pre_container_cpu_usage
+            system_delta = system_cpu_usage - pre_system_cpu_usage
+            
+            if system_delta > 0:
+                # Fórmula de cálculo de CPU em %
+                # NOTA: O cálculo deve ser float
+                cpu_percent = (cpu_delta / system_delta) * number_cpus * 100.0
+        
+        # --- Cálculo do Uso de RAM ---
+        mem_stats = stats.get('memory_stats', {})
+        mem_usage_bytes = mem_stats.get('usage', 0)
+        
+        # O limite deve ser obtido de forma segura (0 se não for encontrado)
+        mem_limit_bytes = mem_stats.get('limit', 0) 
+        
+        ram_percent = 0.0
+        if mem_limit_bytes > 0:
+            ram_percent = (mem_usage_bytes / mem_limit_bytes) * 100.0
+            
+        return jsonify({
+            "status": "success",
+            "metrics": {
+                "cpu_usage": cpu_percent,
+                "ram_usage": ram_percent,
+                "ram_used_mb": mem_usage_bytes / (1024 * 1024),
+                "timestamp": stats.get('read') 
+            }
+        })
+        
+    except docker.errors.NotFound:
+        return jsonify({"status": "error", "message": "Container não encontrado para métricas."}), 404
+    except StopIteration:
+        # Se o container não está rodando, não há estatísticas.
+        return jsonify({"status": "error", "message": "Container não está ativo ou não produz estatísticas."}), 400
+    except Exception as e:
+        print(f"ERRO FATAL NA API DE MÉTRICAS ({id}): {str(e)}")
+        # Retorna 500 para o frontend
+        return jsonify({"status": "error", "message": f"Erro fatal no servidor ao buscar métricas: {str(e)}"}), 500
+
+@app.route('/api/deployments/<id>/stop', methods=['POST'])
+def stop_deployment(id):
+    try:
+        container = docker_client.containers.get(id)
+        container.stop(timeout=5)
+        return jsonify({"status": "success", "message": f"Container {id} parado."})
+    except docker.errors.NotFound:
+        return jsonify({"status": "error", "message": "Container não encontrado."}), 404
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/deployments/<id>/start', methods=['POST'])
+def start_deployment(id):
+    try:
+        container = docker_client.containers.get(id)
+        container.start()
+        return jsonify({"status": "success", "message": f"Container {id} iniciado."})
+    except docker.errors.NotFound:
+        return jsonify({"status": "error", "message": "Container não encontrado."}), 404
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/deployments/<id>', methods=['DELETE'])
+def delete_deployment(id):
+    try:
+        container = docker_client.containers.get(id)
+        
+        # 💡 NOVO: Garante que o container esteja parado antes de tentar remover.
+        if container.status == 'running':
+            container.stop(timeout=5)
+            
+        container.remove(force=True)
+        
+        return jsonify({"status": "success", "message": f"Container {id} excluído."})
+    except docker.errors.NotFound:
+        return jsonify({"status": "error", "message": "Container não encontrado."}), 404
+    except Exception as e:
+        # 💡 Dica: Imprima o erro para o terminal para depuração
+        print(f"ERRO DELETANDO CONTAINER {id}: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# --- Next.js Management Functions (Moved from App Class) ---
+
+def start_nextjs_server():
+    """Inicia o servidor Next.js como um subprocesso."""
+    global nextjs_process
+    
+    if not os.path.exists(NODE_PATH) or not os.path.exists(NEXT_START_SCRIPT):
+        print(f"ERRO: Binário Node.js ou script Next não encontrado! Verifique os caminhos:")
+        print(f"Esperado NODE_PATH: {NODE_PATH}") # Print paths for debugging
+        print(f"Esperado NEXT_SCRIPT: {NEXT_START_SCRIPT}")
+        return
+
+    print(f"INFO: Iniciando servidor Next.js em http://localhost:{NEXTJS_PORT}...")
+
+    try:
+        # Command: node [path/to/next-start-script] start -H 127.0.0.1 --port [PORT]
+        nextjs_process = subprocess.Popen(
+            [NODE_PATH, NEXT_START_SCRIPT, "start", "-H", "127.0.0.1", "--port", str(NEXTJS_PORT)],
+            cwd=NEXTJS_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
+        )
+        print("INFO: Servidor Next.js iniciado com sucesso em segundo plano.")
+        
+        # 💡 Open the browser automatically 
+        import webbrowser
+        webbrowser.open_new_tab(f"http://localhost:{NEXTJS_PORT}")
+
+    except Exception as e:
+        print(f"ERRO ao iniciar Next.js: {e}")
+
+def stop_nextjs_server():
+    """Para o servidor Next.js quando o aplicativo Python é fechado."""
+    global nextjs_process
+    if nextjs_process:
+        print("INFO: Encerrando servidor Next.js...")
+        try:
+            nextjs_process.terminate()
+            nextjs_process.wait(timeout=5)
+            print("INFO: Servidor Next.js encerrado.")
+        except:
+            nextjs_process.kill()
+            print("INFO: Servidor Next.js encerrado (kill forçado).")
+
+if __name__ == '__main__':
+    # 1. Register cleanup function
+    atexit.register(stop_nextjs_server)
+    
+    # 2. Connect to Docker
+    connect_docker()
+    
+    # 3. Start the Next.js frontend (this opens the browser)
+    start_nextjs_server()
+    
+    # 4. Start the Python API (This must run last and blocks the thread, serving the API)
+    print(f"INFO: Servidor Python API rodando em http://localhost:{PYTHON_API_PORT}")
+    app.run(port=PYTHON_API_PORT)
